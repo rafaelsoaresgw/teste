@@ -150,6 +150,7 @@ ul{list-style:none}
   pointer-events:none;
   transform:translate3d(0,0,0);
   backface-visibility:hidden;
+  will-change:transform;
   contain:paint;
 }
 .hero__overlay{
@@ -1399,7 +1400,7 @@ ul{list-style:none}
 <section class="hero" id="scrollHero">
   <div class="hero__sticky">
     <div class="hero__bg">
-      <video id="heroScrollVideo" data-scroll-video data-src="assets/Background video_ 4K loop.mp4" data-mobile-src="assets/mobile-scroll.mp4" muted playsinline webkit-playsinline preload="auto"></video>
+      <video id="heroScrollVideo" data-scroll-video data-src="assets/desktop-scroll.mp4" data-mobile-src="assets/mobile-scroll-smooth.mp4" muted playsinline webkit-playsinline preload="auto"></video>
       <canvas id="heroScrollCanvas" class="hero__scroll-canvas" aria-hidden="true"></canvas>
       <div class="hero__overlay"></div>
     </div>
@@ -1980,7 +1981,7 @@ if (heroTitle) {
   }
 }
 
-/* ============ HERO SCROLL — VIDEO SCRUB ESTÁVEL (DESKTOP + MOBILE) ============ */
+/* ============ HERO SCROLL — SUAVE / OTIMIZADO (DESKTOP + MOBILE) ============ */
 const scrollHero = document.getElementById('scrollHero');
 const heroScrollVideo = document.getElementById('heroScrollVideo');
 const heroScrollCanvas = document.getElementById('heroScrollCanvas');
@@ -1990,14 +1991,11 @@ if (scrollHero && heroScrollVideo) {
   const mobileMedia = window.matchMedia('(max-width: 820px), (pointer: coarse)');
   const isMobile = mobileMedia.matches;
 
-  // Canvas desativado de forma definitiva no mobile: evita artefatos em faixas
-  // durante repaint de sticky no Chrome/Android.
-  if (heroScrollCanvas) {
-    heroScrollCanvas.style.display = 'none';
-  }
+  // Canvas permanece desligado: o scrub é feito só pelo vídeo otimizado.
+  if (heroScrollCanvas) heroScrollCanvas.style.display = 'none';
 
-  const desktopSource = heroScrollVideo.dataset.src || 'assets/Background video_ 4K loop.mp4';
-  const mobileSource = heroScrollVideo.dataset.mobileSrc || 'assets/mobile-scroll.mp4';
+  const desktopSource = heroScrollVideo.dataset.src || 'assets/desktop-scroll.mp4';
+  const mobileSource = heroScrollVideo.dataset.mobileSrc || 'assets/mobile-scroll-smooth.mp4';
   heroScrollVideo.src = isMobile ? mobileSource : desktopSource;
   heroScrollVideo.muted = true;
   heroScrollVideo.playsInline = true;
@@ -2008,11 +2006,19 @@ if (scrollHero && heroScrollVideo) {
   let duration = 0;
   let heroTop = 0;
   let heroTravel = 1;
-  let raf = 0;
   let ready = false;
-  let pending = false;
-  let target = 0;
-  let lastApplied = -1;
+  let targetProgress = 0;
+  let smoothProgress = 0;
+  let raf = 0;
+  let heroVisible = true;
+  let lastSeekAt = 0;
+  let lastSeekTime = -1;
+  let resizeTimer = 0;
+
+  // Menos seeks no celular; 24 fps já casa com o vídeo e reduz trabalho do decoder.
+  const seekInterval = isMobile ? 1000 / 22 : 1000 / 28;
+  const smoothing = isMobile ? 0.19 : 0.23;
+  const minDelta = isMobile ? 1 / 120 : 1 / 180;
 
   function cacheGeometry() {
     const rect = scrollHero.getBoundingClientRect();
@@ -2022,76 +2028,116 @@ if (scrollHero && heroScrollVideo) {
     heroTravel = Math.max(1, scrollHero.offsetHeight - viewportH);
   }
 
-  function progress() {
+  function getProgress() {
     return clamp((window.scrollY - heroTop) / heroTravel, 0, 1);
   }
 
-  function computeTarget() {
+  function safeTime(progress) {
     if (!duration) return 0;
-    const safeEnd = Math.max(0, duration - 1 / 30);
-    return clamp(progress() * safeEnd, 0, safeEnd);
+    const end = Math.max(0, duration - 1 / 24);
+    return clamp(progress * end, 0, end);
   }
 
-  function applySeek() {
-    raf = 0;
+  function seekVideo(time) {
     if (!ready || !duration) return;
+    if (Math.abs(time - lastSeekTime) < minDelta) return;
 
-    target = computeTarget();
-    const current = heroScrollVideo.currentTime || 0;
-    const threshold = isMobile ? 0.028 : 0.018;
+    // Não cria uma fila de seeks. O próximo frame usa sempre o alvo mais novo.
+    if (heroScrollVideo.seeking) return;
 
-    if (Math.abs(target - current) < threshold) return;
-
-    // Em mobile, não empilha dezenas de seeks enquanto o decoder ainda trabalha.
-    // Assim que o seek atual termina, buscamos imediatamente a posição mais recente.
-    if (isMobile && heroScrollVideo.seeking) {
-      pending = true;
-      return;
-    }
-
-    pending = false;
-    lastApplied = target;
+    lastSeekTime = time;
     try {
-      heroScrollVideo.currentTime = target;
+      // currentTime é mais consistente entre Chrome Android, Safari iOS e desktop.
+      heroScrollVideo.currentTime = time;
     } catch (_) {}
   }
 
+  function animate(now) {
+    raf = 0;
+    if (!ready || !heroVisible) return;
+
+    const diff = targetProgress - smoothProgress;
+
+    // Interpolação evita o efeito de "pulos" quando o dedo/roda manda deltas grandes.
+    if (Math.abs(diff) > 0.00035) {
+      smoothProgress += diff * smoothing;
+    } else {
+      smoothProgress = targetProgress;
+    }
+
+    if (now - lastSeekAt >= seekInterval) {
+      lastSeekAt = now;
+      seekVideo(safeTime(smoothProgress));
+    }
+
+    if (Math.abs(targetProgress - smoothProgress) > 0.00035 || heroScrollVideo.seeking) {
+      raf = requestAnimationFrame(animate);
+    }
+  }
+
   function schedule() {
-    if (!raf) raf = requestAnimationFrame(applySeek);
+    targetProgress = getProgress();
+    if (!raf && ready && heroVisible) raf = requestAnimationFrame(animate);
   }
 
   function initVideo() {
-    duration = Number.isFinite(heroScrollVideo.duration) ? heroScrollVideo.duration : 0;
-    if (!duration) return;
+    const d = heroScrollVideo.duration;
+    if (!Number.isFinite(d) || d <= 0) return;
+
+    duration = d;
     ready = true;
     try { heroScrollVideo.pause(); } catch (_) {}
     cacheGeometry();
-    schedule();
+    targetProgress = getProgress();
+    smoothProgress = targetProgress;
+    seekVideo(safeTime(targetProgress));
   }
 
-  heroScrollVideo.addEventListener('loadedmetadata', initVideo);
-  heroScrollVideo.addEventListener('canplay', initVideo);
+  if ('IntersectionObserver' in window) {
+    const observer = new IntersectionObserver(([entry]) => {
+      heroVisible = entry.isIntersecting;
+      if (heroVisible) {
+        targetProgress = getProgress();
+        smoothProgress = targetProgress;
+        schedule();
+      } else if (raf) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+      }
+    }, { rootMargin: '30% 0px 30% 0px' });
+    observer.observe(scrollHero);
+  }
+
+  heroScrollVideo.addEventListener('loadedmetadata', initVideo, { once: true });
+  heroScrollVideo.addEventListener('canplay', () => {
+    if (!ready) initVideo();
+  }, { once: true });
   heroScrollVideo.addEventListener('seeked', () => {
-    if (!ready) return;
-    const newest = computeTarget();
-    if (pending || Math.abs(newest - lastApplied) > (isMobile ? 0.035 : 0.02)) {
-      pending = false;
-      schedule();
-    }
+    if (heroVisible && Math.abs(targetProgress - smoothProgress) > 0.00035) schedule();
   });
 
   window.addEventListener('scroll', schedule, { passive: true });
   window.addEventListener('touchmove', schedule, { passive: true });
+
   window.addEventListener('resize', () => {
-    cacheGeometry();
-    schedule();
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      cacheGeometry();
+      targetProgress = getProgress();
+      smoothProgress = targetProgress;
+      schedule();
+    }, 120);
   }, { passive: true });
+
   window.addEventListener('orientationchange', () => {
     setTimeout(() => {
       cacheGeometry();
+      targetProgress = getProgress();
+      smoothProgress = targetProgress;
       schedule();
-    }, 250);
+    }, 260);
   }, { passive: true });
+
   window.addEventListener('load', () => {
     cacheGeometry();
     schedule();
